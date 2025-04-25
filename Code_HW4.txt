@@ -1,0 +1,168 @@
+### SPARK PREPROCESSOR CODE
+
+#!/usr/bin/env python3
+
+import findspark
+findspark.init()
+
+from pyspark.sql import SparkSession
+
+def parse_line(line):
+    parts = line.split(',', 1)
+    if len(parts) < 2:
+        return []
+    term_part, clicks_part = parts
+    term = term_part.split(':', 1)[1].strip()
+    pairs = [p.strip() for p in clicks_part.split('~')]
+    output = []
+    for pair in pairs:
+        if ':' not in pair:
+            continue
+        url, cnt = pair.rsplit(':', 1)
+        try:
+            clicks = int(cnt)
+        except ValueError:
+            continue
+        output.append((term, url, clicks))
+    return output
+
+if __name__ == "__main__":
+    spark = SparkSession.builder \
+        .appName("PreprocessSearchLog") \
+        .getOrCreate()
+    sc = spark.sparkContext
+
+    # Read & parse
+    lines = sc.textFile("search.log")
+    flat = lines.flatMap(parse_line)
+
+    # Build DataFrame
+    df = spark.createDataFrame(flat, ["term", "url", "clicks"])
+
+    # Repartition so each part file gets one record
+    count = df.count()
+    df2 = df.repartition(count)
+
+    # Write out JSON
+    df2.write.mode("overwrite").json("processed_data")
+
+    spark.stop()
+
+
+### FLASK APP CODE
+
+#!/usr/bin/env python3
+import glob
+import json
+from collections import defaultdict, OrderedDict
+from flask import Flask, request, Response, jsonify
+
+app = Flask(__name__)
+
+def normalize_term(t):
+    t = t.strip()
+    t = t.strip("‘’\"'")
+    return t
+
+_domain_priority = {
+    ".org": 0,
+    ".edu": 1,
+    ".com": 2
+}
+
+def domain_priority(url):
+    for ext, pr in _domain_priority.items():
+        if url.endswith(ext):
+            return pr
+    return len(_domain_priority)
+
+def sort_key(item):
+    url = item[0]
+    clicks = item[1]
+    return (-clicks, domain_priority(url))
+
+term_to_url = defaultdict(dict)
+url_to_term = defaultdict(dict)
+
+for path in glob.glob("processed_data/part-*.json"):
+    with open(path) as f:
+        for line in f:
+            record = json.loads(line)
+            term = normalize_term(record["term"])
+            url = record["url"]
+            clicks = record["clicks"]
+            term_to_url[term][url] = clicks
+            url_to_term[url][term] = clicks
+
+term_totals = {}
+for term, url_map in term_to_url.items():
+    total = 0
+    for count in url_map.values():
+        total += count
+    term_totals[term] = total
+
+url_totals = {}
+for url, term_map in url_to_term.items():
+    total = 0
+    for count in term_map.values():
+        total += count
+    url_totals[url] = total
+
+@app.route("/results", methods=["POST"])
+def results():
+    data = request.get_json(force=True)
+    term = ""
+    if "term" in data:
+        term = normalize_term(data["term"])
+    output = OrderedDict()
+    if term in term_to_url:
+        items = list(term_to_url[term].items())
+        items.sort(key=sort_key)
+        for pair in items:
+            output[pair[0]] = pair[1]
+    result_json = json.dumps({"results": output})
+    return Response(result_json, mimetype="application/json")
+
+@app.route("/trends", methods=["POST"])
+def trends():
+    data = request.get_json(force=True)
+    term = ""
+    if "term" in data:
+        term = normalize_term(data["term"])
+    clicks = 0
+    if term in term_totals:
+        clicks = term_totals[term]
+    return jsonify(clicks=clicks)
+
+@app.route("/popularity", methods=["POST"])
+def popularity():
+    data = request.get_json(force=True)
+    url = ""
+    if "url" in data:
+        url = data["url"]
+    clicks = 0
+    if url in url_totals:
+        clicks = url_totals[url]
+    return jsonify(clicks=clicks)
+
+@app.route("/getBestTerms", methods=["POST"])
+def get_best_terms():
+    data = request.get_json(force=True)
+    website = ""
+    if "website" in data:
+        website = data["website"]
+    best = []
+    total = 0
+    if website in url_totals:
+        total = url_totals[website]
+    if website in url_to_term and total > 0:
+        term_map = url_to_term[website]
+        for term, count in term_map.items():
+            fraction = count / total
+            if fraction > 0.05:
+                best.append(term)
+        best.sort()
+    return jsonify(best_terms=best)
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=80)
